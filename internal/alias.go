@@ -57,8 +57,8 @@ func typeKey(obj *types.TypeName) string {
 }
 
 // parse records every exported alias in pkg whose target is a named type in an
-// internal package. If several packages alias the same type, the alias with the
-// first name alphabetically wins, so the results are deterministic. Whether an
+// internal package. If several packages alias the same type, the
+// best one wins (see compareAlias), so the results are deterministic. Whether an
 // alias can actually be used is decided later, per output package, in resolveType.
 func (a AliasIndex) parse(pkg *packages.Package) {
 	// Skip packages with no type info.
@@ -81,11 +81,24 @@ func (a AliasIndex) parse(pkg *packages.Package) {
 		key := typeKey(target.Obj())
 		old, exists := a[key]
 
-		// Save the value if it's new or the earliest alphabetically to be deterministic.
-		if !exists || tn.Type().String() < old.Type().String() {
+		if !exists || replaceAlias(tn, old) {
 			a[key] = tn
 		}
 	}
+}
+
+// replaceAlias reports whether candidate should replace current as the alias for a type.
+// An alias outside any internal package beats one inside, because code outside the module
+// can only ever use the former (an internal one can sort first and would otherwise shadow
+// it). Otherwise, the earliest alphabetically wins, to be deterministic.
+func replaceAlias(candidate, current *types.TypeName) bool {
+	otherInternal := isInternalPath(candidate.Pkg().Path())
+	currentInternal := isInternalPath(current.Pkg().Path())
+	if otherInternal != currentInternal {
+		// If the candidate is not internal and the current isn't, it should replace the current alias.
+		return !otherInternal
+	}
+	return candidate.Type().String() < current.Type().String()
 }
 
 // resolveVar swaps the types of v that the package `from` can't import for their public
@@ -136,6 +149,14 @@ func (a AliasIndex) resolveType(t types.Type, from string) (types.Type, error) {
 		}
 		if changed {
 			return types.Instantiate(nil, t.Origin(), newArgs, false)
+		}
+	case *types.Alias:
+		// A signature can name an alias of a type, e.g. `type Context = internal.Context` where
+		// internal.Context is itself `= workflowcontext.Context`. The alias is as private as the
+		// package declaring it, so look through it to the type it stands for and resolve that.
+		// An alias the output package can import is fine as written.
+		if pkg := t.Obj().Pkg(); pkg != nil && !importable(from, pkg.Path()) {
+			return a.resolveType(types.Unalias(t), from)
 		}
 	case *types.Pointer:
 		e, err := a.resolveType(t.Elem(), from)
